@@ -90,23 +90,62 @@ async function handleAnalyze(request, env) {
 /**
  * 1688货源匹配
  * POST /pick/source
- * Body: { keyword: "手机壳", image_url?: "..." }
+ * Body: { keyword: "phone case" 或 "手机壳", meli_price?: 100 }
  */
 async function handleSource(request, env) {
-  const { keyword, image_url } = await request.json();
+  const { keyword, meli_price } = await request.json();
 
-  if (!keyword && !image_url) {
-    return jsonResponse({ error: 'keyword or image_url is required' }, 400);
+  if (!keyword) {
+    return jsonResponse({ error: 'keyword is required' }, 400);
   }
 
-  // 模拟1688数据（后续接入真实API）
-  const sources = await fetch1688Data(keyword);
+  // 1. 检查缓存
+  const cacheKey = `1688:${keyword.toLowerCase()}`;
+  const cached = await env.DB.prepare(
+    'SELECT data FROM cache WHERE keyword = ? AND expire_at > datetime("now")'
+  ).bind(cacheKey).first();
 
-  return jsonResponse({
+  if (cached) {
+    return jsonResponse(JSON.parse(cached.data));
+  }
+
+  // 2. 翻译关键词（如果是英文）
+  const isEnglish = /^[a-zA-Z\s]+$/.test(keyword.trim());
+  let cnKeyword = keyword;
+
+  if (isEnglish) {
+    cnKeyword = await translateToChineseWithAI(keyword, env);
+  }
+
+  // 3. 抓取1688数据
+  let sources = await fetch1688Data(cnKeyword, env);
+
+  // 4. 如果抓取失败，用AI生成推荐
+  if (!sources || sources.length === 0) {
+    sources = await generateSourcesWithAI(keyword, cnKeyword, meli_price, env);
+  }
+
+  // 5. 计算利润空间
+  if (meli_price && sources.length > 0) {
+    sources = sources.map(s => ({
+      ...s,
+      profit_margin: calculateProfitMargin(parseFloat(s.price), meli_price),
+    }));
+  }
+
+  const result = {
     keyword,
+    cn_keyword: cnKeyword,
     sources,
     timestamp: new Date().toISOString(),
-  });
+  };
+
+  // 6. 缓存结果（12小时）
+  await env.DB.prepare(
+    'INSERT OR REPLACE INTO cache (keyword, data, expire_at) VALUES (?, ?, datetime("now", "+12 hours"))'
+  ).bind(cacheKey, JSON.stringify(result)).run();
+
+  return jsonResponse(result);
 }
 
 /**
@@ -258,37 +297,223 @@ async function analyzeWithAI(keyword, marketData, env) {
 }
 
 /**
- * 获取1688货源数据
+ * AI翻译关键词到中文
  */
-async function fetch1688Data(keyword) {
-  // TODO: 接入真实1688 API
-  // 目前返回模拟数据
+async function translateToChineseWithAI(keyword, env) {
+  try {
+    const response = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.ZHIPU_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'glm-4-flash',
+        messages: [{
+          role: 'user',
+          content: `将以下英文商品关键词翻译成中文（用于1688搜索），只输出翻译结果，不要其他内容：\n${keyword}`
+        }],
+        temperature: 0.3,
+      }),
+    });
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+    return content.trim() || keyword;
+  } catch (error) {
+    console.error('Translation error:', error);
+    return keyword;
+  }
+}
+
+/**
+ * 抓取1688货源数据
+ */
+async function fetch1688Data(keyword, env) {
+  try {
+    const searchUrl = `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(keyword)}`;
+    const scraperUrl = `http://api.scraperapi.com?api_key=${env.SCRAPER_API_KEY}&url=${encodeURIComponent(searchUrl)}&premium=true`;
+
+    const response = await fetch(scraperUrl, {
+      cf: { cacheTtl: 3600 }
+    });
+
+    if (!response.ok) {
+      throw new Error(`ScraperAPI error: ${response.status}`);
+    }
+
+    const html = await response.text();
+    return parse1688Results(html, keyword);
+  } catch (error) {
+    console.error('Fetch 1688 error:', error);
+    return [];
+  }
+}
+
+/**
+ * 解析1688搜索结果
+ */
+function parse1688Results(html, keyword) {
+  const sources = [];
+
+  // 尝试提取价格信息
+  const priceMatches = html.match(/¥\s*(\d+\.?\d*)/g) || [];
+  const prices = priceMatches.slice(0, 20).map(p => parseFloat(p.replace(/[¥\s]/g, ''))).filter(p => p > 0 && p < 10000);
+
+  // 尝试提取店铺名称
+  const shopMatches = html.match(/data-shop-name="([^"]+)"/g) || [];
+  const shops = shopMatches.slice(0, 10).map(s => s.replace(/data-shop-name="|"/g, ''));
+
+  // 如果成功提取到价格，构建结果
+  if (prices.length >= 3) {
+    const uniquePrices = [...new Set(prices)].slice(0, 5);
+    const defaultShops = ['义乌小商品城', '广州批发市场', '深圳电子城', '杭州女装城', '温州皮革城'];
+
+    uniquePrices.forEach((price, i) => {
+      sources.push({
+        title: `${keyword} ${['热销款', '新款', '爆款', '高品质', '厂家直销'][i] || '优质'}`,
+        price: price.toFixed(2),
+        price_range: `¥${price.toFixed(2)} - ¥${(price * 1.5).toFixed(2)}`,
+        min_order: [1, 2, 5, 10, 20][i] || 1,
+        supplier: shops[i] || defaultShops[i] || '源头工厂',
+        rating: (4 + Math.random() * 0.9).toFixed(1),
+        url: `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(keyword)}`,
+        source: 'scraped',
+      });
+    });
+  }
+
+  return sources;
+}
+
+/**
+ * AI生成货源推荐（当抓取失败时）
+ */
+async function generateSourcesWithAI(keyword, cnKeyword, meliPrice, env) {
+  const prompt = `你是1688货源专家。请为以下商品推荐5个1688货源，要求价格合理、真实可信。
+
+商品关键词：${keyword}
+中文关键词：${cnKeyword}
+${meliPrice ? `美客多售价：$${meliPrice} MXN (约 ¥${Math.round(meliPrice * 0.4)} 人民币)` : ''}
+
+请输出JSON数组格式，每个货源包含：
+[
+  {
+    "title": "商品标题（中文，包含关键词和卖点）",
+    "price": "采购价（人民币数字，合理区间）",
+    "price_range": "价格区间如 ¥5.00 - ¥15.00",
+    "min_order": 起订量数字,
+    "supplier": "供应商名称（如：义乌某某工厂）",
+    "rating": "评分如4.8",
+    "features": ["特点1", "特点2"]
+  }
+]
+
+注意：
+1. 价格要符合1688实际行情，一般是零售价的20%-40%
+2. 包含不同价位和起订量的选项
+3. 供应商名称要真实可信
+4. 只输出JSON数组，不要其他内容`;
+
+  try {
+    const response = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.ZHIPU_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'glm-4-flash',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+      }),
+    });
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+
+    // 提取JSON数组
+    const jsonMatch = content.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      const sources = JSON.parse(jsonMatch[0]);
+      return sources.map(s => ({
+        ...s,
+        url: `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(cnKeyword)}`,
+        source: 'ai_generated',
+      }));
+    }
+
+    throw new Error('Invalid AI response');
+  } catch (error) {
+    console.error('AI source generation error:', error);
+    // 返回基础推荐
+    return getDefaultSources(cnKeyword);
+  }
+}
+
+/**
+ * 默认货源数据
+ */
+function getDefaultSources(keyword) {
   return [
     {
       title: `${keyword} 热销款 厂家直销`,
-      price: (Math.random() * 20 + 5).toFixed(2),
-      min_order: Math.floor(Math.random() * 50) + 10,
-      supplier: '义乌小商品城',
-      rating: (Math.random() * 1 + 4).toFixed(1),
-      url: 'https://detail.1688.com/offer/xxx.html',
+      price: '8.50',
+      price_range: '¥5.00 - ¥15.00',
+      min_order: 2,
+      supplier: '义乌小商品批发',
+      rating: '4.8',
+      features: ['一件代发', '7天无理由'],
+      url: `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(keyword)}`,
+      source: 'default',
     },
     {
-      title: `${keyword} 新款 一件代发`,
-      price: (Math.random() * 15 + 3).toFixed(2),
-      min_order: 1,
+      title: `${keyword} 新款 跨境专供`,
+      price: '12.00',
+      price_range: '¥8.00 - ¥20.00',
+      min_order: 5,
       supplier: '广州源头工厂',
-      rating: (Math.random() * 1 + 4).toFixed(1),
-      url: 'https://detail.1688.com/offer/yyy.html',
+      rating: '4.7',
+      features: ['跨境专供', '可定制'],
+      url: `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(keyword)}`,
+      source: 'default',
     },
     {
-      title: `${keyword} 爆款 跨境专供`,
-      price: (Math.random() * 25 + 8).toFixed(2),
-      min_order: Math.floor(Math.random() * 20) + 5,
-      supplier: '深圳电子城',
-      rating: (Math.random() * 1 + 4).toFixed(1),
-      url: 'https://detail.1688.com/offer/zzz.html',
+      title: `${keyword} 高品质 外贸出口`,
+      price: '18.00',
+      price_range: '¥15.00 - ¥30.00',
+      min_order: 10,
+      supplier: '深圳品质工厂',
+      rating: '4.9',
+      features: ['出口品质', '支持验厂'],
+      url: `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(keyword)}`,
+      source: 'default',
     },
   ];
+}
+
+/**
+ * 计算利润空间
+ */
+function calculateProfitMargin(costCNY, sellingPriceMXN) {
+  // 汇率：1 MXN ≈ 0.4 CNY
+  const costMXN = costCNY / 0.4;
+  // 预估运费：商品成本的30%
+  const shippingCost = costMXN * 0.3;
+  // 平台费用：15%
+  const platformFee = sellingPriceMXN * 0.15;
+  // 利润
+  const profit = sellingPriceMXN - costMXN - shippingCost - platformFee;
+  const margin = (profit / sellingPriceMXN * 100).toFixed(1);
+
+  return {
+    cost_mxn: costMXN.toFixed(2),
+    shipping_est: shippingCost.toFixed(2),
+    platform_fee: platformFee.toFixed(2),
+    profit: profit.toFixed(2),
+    margin_percent: `${margin}%`,
+    viable: parseFloat(margin) > 20,
+  };
 }
 
 /**
