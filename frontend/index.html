@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>美客多AI选品助手 | Mercado Libre Product Picker</title>
+  <meta name="description" content="AI驱动的美客多选品工具，一键分析市场竞争、发现蓝海机会、匹配1688货源">
+  <meta name="robots" content="noindex, nofollow">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛒</text></svg>">
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            meli: {
+              yellow: '#FFE600',
+              blue: '#3483FA',
+              dark: '#1A1A1A',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Vue 3 -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+
+  <style>
+    [v-cloak] { display: none; }
+    .gradient-bg {
+      background: linear-gradient(135deg, #1A1A1A 0%, #2D2D2D 100%);
+    }
+    .card-hover:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 40px rgba(255, 230, 0, 0.1);
+    }
+    .score-bar {
+      transition: width 0.5s ease-out;
+    }
+    @keyframes pulse-yellow {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 230, 0, 0.4); }
+      50% { box-shadow: 0 0 0 10px rgba(255, 230, 0, 0); }
+    }
+    .pulse-yellow { animation: pulse-yellow 2s infinite; }
+  </style>
+</head>
+<body class="gradient-bg min-h-screen text-white">
+  <div id="app" v-cloak>
+    <!-- Header -->
+    <header class="border-b border-gray-800">
+      <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <span class="text-3xl">🛒</span>
+          <div>
+            <h1 class="text-xl font-bold text-meli-yellow">美客多AI选品助手</h1>
+            <p class="text-xs text-gray-400">Mercado Libre Product Picker</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-4">
+          <select v-model="site" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+            <option value="MLM">🇲🇽 墨西哥</option>
+            <option value="MLB">🇧🇷 巴西</option>
+            <option value="MLA">🇦🇷 阿根廷</option>
+            <option value="MLC">🇨🇱 智利</option>
+            <option value="MCO">🇨🇴 哥伦比亚</option>
+          </select>
+          <span class="text-sm text-gray-400">剩余 <span class="text-meli-yellow font-bold">{{ freeQuota }}</span> 次</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="max-w-6xl mx-auto px-4 py-8">
+      <!-- Search Box -->
+      <div class="bg-gray-900 rounded-2xl p-6 mb-8 border border-gray-800">
+        <div class="flex gap-4">
+          <div class="flex-1 relative">
+            <input
+              v-model="keyword"
+              @keyup.enter="analyze"
+              type="text"
+              placeholder="输入商品关键词，如 phone case, bluetooth earbuds..."
+              class="w-full bg-gray-800 border border-gray-700 rounded-xl px-5 py-4 text-lg focus:border-meli-yellow focus:outline-none transition"
+            >
+            <span v-if="keyword" @click="keyword=''" class="absolute right-4 top-1/2 -translate-y-1/2 text-gray-500 cursor-pointer hover:text-white">✕</span>
+          </div>
+          <button
+            @click="analyze"
+            :disabled="loading || !keyword.trim()"
+            class="bg-meli-yellow text-black font-bold px-8 py-4 rounded-xl hover:bg-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center gap-2"
+          >
+            <span v-if="loading" class="animate-spin">⏳</span>
+            <span v-else>🔍</span>
+            {{ loading ? '分析中...' : '开始分析' }}
+          </button>
+        </div>
+        <div class="mt-4 flex gap-2 flex-wrap">
+          <span class="text-sm text-gray-500">热门搜索：</span>
+          <button
+            v-for="tag in hotTags"
+            :key="tag"
+            @click="keyword = tag; analyze()"
+            class="text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded-full transition"
+          >
+            {{ tag }}
+          </button>
+        </div>
+      </div>
+
+      <!-- Loading State -->
+      <div v-if="loading" class="text-center py-20">
+        <div class="inline-block w-16 h-16 border-4 border-meli-yellow border-t-transparent rounded-full animate-spin mb-4"></div>
+        <p class="text-gray-400">正在分析 "{{ keyword }}" 的市场数据...</p>
+        <p class="text-sm text-gray-600 mt-2">首次查询可能需要 10-15 秒</p>
+      </div>
+
+      <!-- Results -->
+      <div v-else-if="result" class="space-y-6">
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 card-hover transition">
+            <div class="text-gray-400 text-sm mb-1">商品总数</div>
+            <div class="text-2xl font-bold text-white">{{ formatNumber(result.market.total_results) }}</div>
+          </div>
+          <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 card-hover transition">
+            <div class="text-gray-400 text-sm mb-1">价格区间</div>
+            <div class="text-2xl font-bold text-white">${{ result.market.price_min }} - ${{ result.market.price_max }}</div>
+          </div>
+          <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 card-hover transition">
+            <div class="text-gray-400 text-sm mb-1">中位价格</div>
+            <div class="text-2xl font-bold text-meli-yellow">${{ result.market.price_median }}</div>
+          </div>
+          <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 card-hover transition">
+            <div class="text-gray-400 text-sm mb-1">AI建议</div>
+            <div class="text-2xl font-bold" :class="recommendColor">{{ result.analysis.recommendation }}</div>
+          </div>
+        </div>
+
+        <!-- Competition Score -->
+        <div class="bg-gray-900 rounded-xl p-6 border border-gray-800">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="text-lg font-bold">竞争激烈度</h3>
+            <span class="text-3xl font-bold" :class="scoreColor">{{ result.analysis.competition_score }}/10</span>
+          </div>
+          <div class="h-4 bg-gray-800 rounded-full overflow-hidden">
+            <div
+              class="h-full score-bar rounded-full"
+              :class="scoreBarColor"
+              :style="{ width: result.analysis.competition_score * 10 + '%' }"
+            ></div>
+          </div>
+          <p class="mt-3 text-gray-400">{{ result.analysis.reason }}</p>
+        </div>
+
+        <!-- Two Column Layout -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <!-- Blue Ocean Niches -->
+          <div class="bg-gray-900 rounded-xl p-6 border border-gray-800">
+            <h3 class="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>🌊</span> 蓝海细分词
+            </h3>
+            <div class="space-y-3">
+              <div
+                v-for="(niche, i) in result.analysis.sub_niches"
+                :key="i"
+                class="flex items-center gap-3 bg-gray-800 rounded-lg px-4 py-3 hover:bg-gray-700 cursor-pointer transition"
+                @click="keyword = niche; analyze()"
+              >
+                <span class="w-6 h-6 bg-meli-blue rounded-full flex items-center justify-center text-sm">{{ i + 1 }}</span>
+                <span>{{ niche }}</span>
+                <span class="ml-auto text-gray-500">→</span>
+              </div>
+              <div v-if="!result.analysis.sub_niches?.length" class="text-gray-500 text-center py-4">
+                暂无蓝海词建议
+              </div>
+            </div>
+          </div>
+
+          <!-- Differentiation Tips -->
+          <div class="bg-gray-900 rounded-xl p-6 border border-gray-800">
+            <h3 class="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>💡</span> 差异化建议
+            </h3>
+            <ul class="space-y-3">
+              <li
+                v-for="(tip, i) in result.analysis.differentiation_tips"
+                :key="i"
+                class="flex items-start gap-3"
+              >
+                <span class="text-meli-yellow">✓</span>
+                <span class="text-gray-300">{{ tip }}</span>
+              </li>
+              <li v-if="!result.analysis.differentiation_tips?.length" class="text-gray-500 text-center py-4">
+                暂无差异化建议
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- 1688 Sources (Placeholder) -->
+        <div class="bg-gray-900 rounded-xl p-6 border border-gray-800">
+          <h3 class="text-lg font-bold mb-4 flex items-center gap-2">
+            <span>📦</span> 1688货源匹配
+            <span class="text-xs bg-gray-700 px-2 py-1 rounded-full">即将上线</span>
+          </h3>
+          <div class="text-center py-8 text-gray-500">
+            <p>🚧 货源匹配功能开发中...</p>
+            <p class="text-sm mt-2">输入关键词后将自动匹配1688同款货源</p>
+          </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="flex gap-4 justify-center">
+          <button
+            @click="favorite"
+            class="bg-gray-800 hover:bg-gray-700 px-6 py-3 rounded-xl flex items-center gap-2 transition"
+          >
+            <span>⭐</span> 收藏此分析
+          </button>
+          <button
+            @click="exportResult"
+            class="bg-gray-800 hover:bg-gray-700 px-6 py-3 rounded-xl flex items-center gap-2 transition"
+          >
+            <span>📥</span> 导出报告
+          </button>
+          <button
+            @click="result = null; keyword = ''"
+            class="bg-meli-blue hover:bg-blue-600 px-6 py-3 rounded-xl flex items-center gap-2 transition"
+          >
+            <span>🔄</span> 新的分析
+          </button>
+        </div>
+      </div>
+
+      <!-- Empty State -->
+      <div v-else class="text-center py-20">
+        <div class="text-6xl mb-4">🔍</div>
+        <h2 class="text-2xl font-bold mb-2">输入关键词开始选品</h2>
+        <p class="text-gray-400 max-w-md mx-auto">
+          AI 将自动分析该品类在美客多的竞争情况，并给出选品建议和蓝海机会
+        </p>
+      </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="border-t border-gray-800 mt-12">
+      <div class="max-w-6xl mx-auto px-4 py-6 text-center text-gray-500 text-sm">
+        <p>© 2025 美客多AI选品助手 | Powered by 8ai.chat</p>
+      </div>
+    </footer>
+
+    <!-- Toast -->
+    <div
+      v-if="toast.show"
+      class="fixed bottom-8 left-1/2 -translate-x-1/2 bg-gray-800 text-white px-6 py-3 rounded-xl shadow-lg flex items-center gap-2"
+    >
+      <span>{{ toast.icon }}</span>
+      <span>{{ toast.message }}</span>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, computed } = Vue;
+
+    createApp({
+      setup() {
+        // State
+        const keyword = ref('');
+        const site = ref('MLM');
+        const loading = ref(false);
+        const result = ref(null);
+        const freeQuota = ref(3);
+        const toast = ref({ show: false, message: '', icon: '' });
+
+        // Hot tags
+        const hotTags = ['phone case', 'bluetooth earbuds', 'led lights', 'yoga mat', 'car accessories'];
+
+        // API Base URL
+        const API_BASE = 'https://api.8ai.chat';
+
+        // Computed
+        const recommendColor = computed(() => {
+          if (!result.value) return '';
+          const rec = result.value.analysis.recommendation;
+          if (rec === '推荐') return 'text-green-400';
+          if (rec === '避开') return 'text-red-400';
+          return 'text-yellow-400';
+        });
+
+        const scoreColor = computed(() => {
+          if (!result.value) return '';
+          const score = result.value.analysis.competition_score;
+          if (score <= 3) return 'text-green-400';
+          if (score <= 6) return 'text-yellow-400';
+          return 'text-red-400';
+        });
+
+        const scoreBarColor = computed(() => {
+          if (!result.value) return '';
+          const score = result.value.analysis.competition_score;
+          if (score <= 3) return 'bg-green-500';
+          if (score <= 6) return 'bg-yellow-500';
+          return 'bg-red-500';
+        });
+
+        // Methods
+        const formatNumber = (num) => {
+          if (num >= 10000) return (num / 10000).toFixed(1) + '万';
+          if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
+          return num;
+        };
+
+        const showToast = (message, icon = '✓') => {
+          toast.value = { show: true, message, icon };
+          setTimeout(() => {
+            toast.value.show = false;
+          }, 3000);
+        };
+
+        const analyze = async () => {
+          if (!keyword.value.trim() || loading.value) return;
+
+          if (freeQuota.value <= 0) {
+            showToast('免费次数已用完，请升级VIP', '⚠️');
+            return;
+          }
+
+          loading.value = true;
+          result.value = null;
+
+          try {
+            const response = await fetch(`${API_BASE}/pick/analyze`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                keyword: keyword.value.trim(),
+                site: site.value
+              })
+            });
+
+            if (!response.ok) throw new Error('API error');
+
+            result.value = await response.json();
+            freeQuota.value--;
+            showToast('分析完成！', '✅');
+          } catch (error) {
+            console.error('Analyze error:', error);
+            // 使用模拟数据用于演示
+            result.value = getMockResult();
+            showToast('使用演示数据（API连接中）', 'ℹ️');
+          } finally {
+            loading.value = false;
+          }
+        };
+
+        const getMockResult = () => ({
+          keyword: keyword.value,
+          site: site.value,
+          market: {
+            total_results: Math.floor(Math.random() * 50000) + 5000,
+            price_min: Math.floor(Math.random() * 30) + 10,
+            price_max: Math.floor(Math.random() * 300) + 100,
+            price_median: Math.floor(Math.random() * 80) + 40,
+            price_avg: Math.floor(Math.random() * 70) + 35,
+          },
+          analysis: {
+            competition_score: Math.floor(Math.random() * 10) + 1,
+            competition_level: ['低', '中', '高'][Math.floor(Math.random() * 3)],
+            profit_potential: ['高', '中', '低'][Math.floor(Math.random() * 3)],
+            recommendation: ['推荐', '观望', '避开'][Math.floor(Math.random() * 3)],
+            reason: '该品类在墨西哥市场有一定需求，但需注意差异化竞争',
+            sub_niches: [
+              keyword.value + ' premium',
+              keyword.value + ' mini',
+              keyword.value + ' for kids',
+            ],
+            differentiation_tips: [
+              '可考虑增加本地化包装设计',
+              '提供西班牙语说明书和客服',
+              '选择轻便款降低物流成本',
+            ],
+          },
+          timestamp: new Date().toISOString(),
+        });
+
+        const favorite = () => {
+          showToast('已添加到收藏！', '⭐');
+        };
+
+        const exportResult = () => {
+          if (!result.value) return;
+          const text = JSON.stringify(result.value, null, 2);
+          const blob = new Blob([text], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `meli-analysis-${keyword.value}-${Date.now()}.json`;
+          a.click();
+          URL.revokeObjectURL(url);
+          showToast('报告已导出！', '📥');
+        };
+
+        return {
+          keyword,
+          site,
+          loading,
+          result,
+          freeQuota,
+          toast,
+          hotTags,
+          recommendColor,
+          scoreColor,
+          scoreBarColor,
+          formatNumber,
+          analyze,
+          favorite,
+          exportResult,
+        };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
